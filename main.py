@@ -1,4 +1,5 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset, load_from_disk
 
 
 # ============================================================
@@ -43,6 +44,14 @@ def zero_shot(model, tokenizer, prompt):
     return result
 
 
+# ============================================================
+# 2. dataset
+# ============================================================
+def loading_dataset(dataset_name):
+    dataset = load_dataset(dataset_name)
+    return dataset
+
+
 if __name__ == "__main__":
     # model_name = "bigscience/bloomz-560m"
     model_name = "bigscience/bloomz-1b1"
@@ -53,5 +62,16 @@ if __name__ == "__main__":
     # ---------------------------------------------------------
     base_model, base_tokenizer = load_base_model_and_tokenizer(model_name)
 
-    test_prompt = "there are two nice things that should matter to you: "
-    print(zero_shot(base_model, base_tokenizer, test_prompt))
+    # prompt = "there are two nice things that should matter to you: "
+    # print(zero_shot(base_model, base_tokenizer, prompt))
+
+    # 2. dataset
+    # ---------------------------------------------------------
+    dataset1_name = "fka/prompts.chat"
+    dataset2_name = "Abirate/english_quotes"
+
+    dataset1 = load_dataset(dataset1_name)
+    print(dataset1.column_names)
+
+    dataset2 = load_dataset(dataset2_name)
+    print(dataset2.column_names)
