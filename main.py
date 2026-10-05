@@ -1,5 +1,6 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset, load_from_disk, Dataset, DatasetDict, Value
+from peft import get_peft_model, PromptTuningConfig, TaskType, PromptTuningInit
 from collections import Counter
 import numpy as np
 
@@ -206,10 +207,30 @@ def dataset_first_look(dataset, sample_size=2, text_columns=None):
     print("=" * 70)
 
 
+# ============================================================
+# 3. prompt tuning
+# ============================================================
+def generation_config(model_name, virtual_token):
+    config = PromptTuningConfig(
+        task_type=TaskType.CAUSAL_LM,
+        prompt_tuning_init=PromptTuningInit.RANDOM,
+        num_virtual_tokens=virtual_token,
+        tokenizer_name_or_path=model_name,
+    )
+
+    return config
+
+
+def build_peft_model(model, peft_config):
+    peft_model = get_peft_model(model, peft_config)
+    peft_model.print_trainable_parameters()
+    return peft_model
+
+
 if __name__ == "__main__":
     # model_name = "bigscience/bloomz-560m"
     model_name = "bigscience/bloomz-1b1"
-    NUM_VIRTUAL_TOKEN = 4
+    NUM_VIRTUAL_TOKEN = 50
     NUM_EPOCHS = 10
 
     # 1. base model
@@ -225,7 +246,12 @@ if __name__ == "__main__":
     dataset2_name = "Abirate/english_quotes"
 
     dataset1 = load_dataset(dataset1_name)
-    dataset_first_look(dataset1)
+    # dataset_first_look(dataset1)
 
     dataset2 = load_dataset(dataset2_name)
-    dataset_first_look(dataset2)
+    # dataset_first_look(dataset2)
+
+    # 3. prompt tuning
+    # ---------------------------------------------------------
+    peft_config = generation_config(model_name, NUM_VIRTUAL_TOKEN)
+    peft_model = build_peft_model(base_model, peft_config)
