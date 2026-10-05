@@ -1,5 +1,7 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset, load_from_disk, Dataset, DatasetDict, Value
+from collections import Counter
+import numpy as np
 
 
 # ============================================================
@@ -52,6 +54,158 @@ def loading_dataset(dataset_name):
     return dataset
 
 
+def dataset_first_look(dataset, sample_size=2, text_columns=None):
+    # ---------- Normalize input ----------
+    if isinstance(dataset, Dataset):
+        dataset = DatasetDict({"train": dataset})
+
+    if not isinstance(dataset, DatasetDict):
+        raise TypeError("Input must be a Dataset or DatasetDict.")
+
+    print("\n" + "=" * 70)
+    print("DATASET FIRST LOOK")
+    print("=" * 70)
+
+    # ---------- 1) Splits ----------
+    print("\n[1] SPLITS")
+    print(f"    Number of splits: {len(dataset)}")
+    for split_name, split_data in dataset.items():
+        print(f"    - {split_name}: {len(split_data):,} rows")
+
+    total_rows = sum(len(d) for d in dataset.values())
+    print(f"    -> Total rows: {total_rows:,}")
+
+    # Use the first split for structural analysis
+    first_split_name = list(dataset.keys())[0]
+    first_split = dataset[first_split_name]
+
+    # ---------- 2) Column names ----------
+    print(f"\n[2] COLUMNS (based on split: {first_split_name})")
+    print(f"    {first_split.column_names}")
+
+    # ---------- 3) Column types ----------
+    print(f"\n[3] COLUMN TYPES")
+    features = first_split.features
+    for col_name, feat in features.items():
+        print(f"    - {col_name}: {feat}")
+
+    # ---------- 4) Unique values per column ----------
+    print(f"\n[4] UNIQUE VALUES PER COLUMN")
+    for col_name in first_split.column_names:
+        try:
+            values = first_split[col_name]
+            unique_vals = set(values)
+            n_unique = len(unique_vals)
+
+            if n_unique <= 20:
+                counter = Counter(values)
+                print(f"    - {col_name}: {n_unique} unique values")
+                for val, count in counter.most_common():
+                    pct = 100 * count / len(values)
+                    print(f"        * {val!r}: {count:,} ({pct:.1f}%)")
+            else:
+                print(f"    - {col_name}: {n_unique:,} unique values")
+        except Exception as e:
+            print(f"    - {col_name}: could not be computed ({e})")
+
+    # ---------- 5) Null / missing values ----------
+    print(f"\n[5] NULL / MISSING VALUES")
+    for col_name in first_split.column_names:
+        try:
+            values = first_split[col_name]
+            n_null = sum(1 for v in values if v is None or v == "")
+            pct = 100 * n_null / len(values) if len(values) else 0
+            status = "OK " if n_null == 0 else "WARN"
+            print(f"    [{status}] {col_name}: {n_null:,} missing ({pct:.2f}%)")
+        except Exception as e:
+            print(f"    [ERR] {col_name}: could not be checked ({e})")
+
+    # ---------- 6) General info ----------
+    print(f"\n[6] GENERAL INFO")
+    print(f"    Total splits: {len(dataset)}")
+    print(f"    Total rows: {total_rows:,}")
+    print(f"    Total columns: {len(first_split.column_names)}")
+    print(f"    Columns: {first_split.column_names}")
+
+    # ---------- 7) Dataset size estimate ----------
+    print(f"\n[7] SIZE ESTIMATE")
+    try:
+        for split_name, split_data in dataset.items():
+            size_bytes = split_data.size_in_bytes
+            size_mb = size_bytes / (1024 * 1024)
+            size_gb = size_mb / 1024
+            if size_gb >= 1:
+                print(f"    - {split_name}: {size_gb:.2f} GB")
+            else:
+                print(f"    - {split_name}: {size_mb:.2f} MB")
+    except Exception as e:
+        print(f"    Could not be computed: {e}")
+
+    # ---------- 8) Text length distribution ----------
+    print(f"\n[8] TEXT LENGTH DISTRIBUTION")
+
+    if text_columns is None:
+        text_columns = []
+        for col_name, feat in features.items():
+            if isinstance(feat, Value) and feat.dtype == "string":
+                text_columns.append(col_name)
+
+    if not text_columns:
+        print("    No text column detected.")
+    else:
+        for col_name in text_columns:
+            try:
+                values = first_split[col_name]
+                lengths = np.array([len(str(v)) for v in values])
+                print(f"    - {col_name}:")
+                print(f"        * min:    {lengths.min()}")
+                print(f"        * max:    {lengths.max()}")
+                print(f"        * mean:   {lengths.mean():.1f}")
+                print(f"        * median: {np.median(lengths):.1f}")
+                print(f"        * std:    {lengths.std():.1f}")
+            except Exception as e:
+                print(f"    - {col_name}: {e}")
+
+    # ---------- 9) Class balance for label-like columns ----------
+    print(f"\n[9] CLASS BALANCE (low-cardinality columns)")
+    for col_name in first_split.column_names:
+        try:
+            values = first_split[col_name]
+            unique_vals = set(values)
+            if 1 < len(unique_vals) <= 20:
+                counter = Counter(values)
+                counts = list(counter.values())
+                imbalance = max(counts) / min(counts) if min(counts) > 0 else float("inf")
+                print(f"    - {col_name}: imbalance ratio = {imbalance:.2f}x")
+                if imbalance > 5:
+                    print(f"        [WARN] Dataset is heavily imbalanced.")
+                elif imbalance > 2:
+                    print(f"        [NOTE] Dataset is slightly imbalanced.")
+                else:
+                    print(f"        [OK]   Dataset is roughly balanced.")
+        except Exception:
+            pass
+
+    # ---------- 10) Samples ----------
+    print(f"\n[10] SAMPLES")
+    for split_name, split_data in dataset.items():
+        n_samples = min(sample_size, len(split_data))
+        print(f"\n    --- {split_name} ---")
+        for i in range(n_samples):
+            sample = split_data[i]
+            print(f"    Sample {i + 1}:")
+            for k, v in sample.items():
+                v_str = str(v)
+                if len(v_str) > 200:
+                    v_str = v_str[:200] + "..."
+                print(f"        {k}: {v_str!r}")
+            print()
+
+    print("=" * 70)
+    print("Analysis finished.")
+    print("=" * 70)
+
+
 if __name__ == "__main__":
     # model_name = "bigscience/bloomz-560m"
     model_name = "bigscience/bloomz-1b1"
@@ -71,7 +225,7 @@ if __name__ == "__main__":
     dataset2_name = "Abirate/english_quotes"
 
     dataset1 = load_dataset(dataset1_name)
-    print(dataset1.column_names)
+    dataset_first_look(dataset1)
 
     dataset2 = load_dataset(dataset2_name)
-    print(dataset2.column_names)
+    dataset_first_look(dataset2)
