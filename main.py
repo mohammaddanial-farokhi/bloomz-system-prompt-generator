@@ -1,4 +1,10 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    TrainingArguments,
+    Trainer,
+    DataCollatorForLanguageModeling,
+)
 from datasets import load_dataset, load_from_disk, Dataset, DatasetDict, Value
 from peft import get_peft_model, PromptTuningConfig, TaskType, PromptTuningInit
 from collections import Counter
@@ -207,6 +213,20 @@ def dataset_first_look(dataset, sample_size=2, text_columns=None):
     print("=" * 70)
 
 
+def prepare_dataset_for_generation(dataset, max_prompt_chars=1500, test_size=0.2):
+    # Filter very long prompts
+    dataset = dataset.filter(lambda x: len(x["prompt"]) < max_prompt_chars)
+    print(f"After filtering long prompts: {len(dataset):,} rows")
+
+    # Keep only needed columns
+    dataset = dataset.remove_columns(["for_devs", "contributor"])
+
+    # Split
+    split = dataset.train_test_split(test_size=test_size, seed=42)
+    print(f"Train: {len(split['train']):,}  |  Val: {len(split['test']):,}")
+    return split["train"], split["test"]
+
+
 # ============================================================
 # 3. prompt tuning
 # ============================================================
@@ -233,8 +253,20 @@ def create_training_arguments(path, epochs, learning_rate=0.0035):
         auto_find_batch_size=True,
         learning_rate=learning_rate,
         num_train_epochs=epochs,
+        remove_unused_columns=False,
+        save_total_limit=3,
     )
     return training_args
+
+
+def create_trainer(model, tokenizer, training_args, train_dataset):
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
+    )
+    return trainer
 
 
 if __name__ == "__main__":
@@ -253,18 +285,24 @@ if __name__ == "__main__":
 
     # 2. dataset
     # ---------------------------------------------------------
-    dataset1_name = "fka/prompts.chat"
-    dataset2_name = "Abirate/english_quotes"
+    dataset_name = "fka/prompts.chat"
 
-    dataset1 = load_dataset(dataset1_name)
-    # dataset_first_look(dataset1)
+    dataset = load_dataset(dataset_name)
+    # dataset_first_look(dataset)
 
-    dataset2 = load_dataset(dataset2_name)
-    # dataset_first_look(dataset2)
+    dataset_train, dataset_test = prepare_dataset_for_generation(dataset)
 
     # 3. prompt tuning
     # ---------------------------------------------------------
-    peft_config = generation_config(model_name, NUM_VIRTUAL_TOKEN)
-    peft_model = build_peft_model(base_model, peft_config)
+    # peft_config = generation_config(model_name, NUM_VIRTUAL_TOKEN)
+    # peft_model = build_peft_model(base_model, peft_config)
 
-    trainin_arg_prompt = create_training_arguments(OUTPUT_DIR_PROMPT, NUM_EPOCHS)
+    # trainin_arg = create_training_arguments(OUTPUT_DIR_PROMPT, NUM_EPOCHS)
+
+    # if base_tokenizer.pad_token is None:
+    #     base_tokenizer.pad_token = base_tokenizer.eos_token
+
+    # tokenized_train = tokenize_dataset(dataset["train"], base_tokenizer, "act")
+
+    # trainer = create_trainer(peft_model, base_tokenizer, trainin_arg, tokenized_train)
+    # trainer.train()
