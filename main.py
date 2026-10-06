@@ -1,4 +1,4 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 from datasets import load_dataset, load_from_disk, Dataset, DatasetDict, Value
 from peft import get_peft_model, PromptTuningConfig, TaskType, PromptTuningInit
 from collections import Counter
@@ -227,11 +227,22 @@ def build_peft_model(model, peft_config):
     return peft_model
 
 
+def create_training_arguments(path, epochs, learning_rate=0.0035):
+    training_args = TrainingArguments(
+        output_dir=path,
+        auto_find_batch_size=True,
+        learning_rate=learning_rate,
+        num_train_epochs=epochs,
+    )
+    return training_args
+
+
 if __name__ == "__main__":
     # model_name = "bigscience/bloomz-560m"
     model_name = "bigscience/bloomz-1b1"
     NUM_VIRTUAL_TOKEN = 50
     NUM_EPOCHS = 10
+    OUTPUT_DIR_PROMPT = "./data/prompt_data"
 
     # 1. base model
     # ---------------------------------------------------------
@@ -255,3 +266,5 @@ if __name__ == "__main__":
     # ---------------------------------------------------------
     peft_config = generation_config(model_name, NUM_VIRTUAL_TOKEN)
     peft_model = build_peft_model(base_model, peft_config)
+
+    trainin_arg_prompt = create_training_arguments(OUTPUT_DIR_PROMPT, NUM_EPOCHS)
