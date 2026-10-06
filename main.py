@@ -1,3 +1,16 @@
+import os
+import torch
+
+_original_torch_load = torch.load
+
+
+def _patched_torch_load(*args, **kwargs):
+    kwargs["weights_only"] = False
+    return _original_torch_load(*args, **kwargs)
+
+
+torch.load = _patched_torch_load
+
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -9,9 +22,7 @@ from datasets import load_dataset, load_from_disk, Dataset, DatasetDict, Value
 from peft import get_peft_model, PromptTuningConfig, TaskType, PromptTuningInit, PeftModel
 from collections import Counter
 import numpy as np
-import torch
 import math
-import os
 import glob
 
 
