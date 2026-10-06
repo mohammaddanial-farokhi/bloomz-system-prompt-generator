@@ -3,12 +3,16 @@ from transformers import (
     AutoTokenizer,
     TrainingArguments,
     Trainer,
-    DataCollatorForLanguageModeling,
+    DataCollatorForSeq2Seq,
 )
 from datasets import load_dataset, load_from_disk, Dataset, DatasetDict, Value
-from peft import get_peft_model, PromptTuningConfig, TaskType, PromptTuningInit
+from peft import get_peft_model, PromptTuningConfig, TaskType, PromptTuningInit, PeftModel
 from collections import Counter
 import numpy as np
+import torch
+import math
+import os
+import glob
 
 
 # ============================================================
@@ -227,10 +231,57 @@ def prepare_dataset_for_generation(dataset, max_prompt_chars=1500, test_size=0.2
     return split["train"], split["test"]
 
 
+def tokenize_for_generation(dataset, tokenizer, act_col, prompt_col, max_length=512):
+    def _build_prompt(act):
+        return f"act: {act}\nprompt:"
+
+    def _build_target(prompt):
+        return f" {prompt}{tokenizer.eos_token}"
+
+    def _tokenize(batch):
+        input_texts = [_build_prompt(a) for a in batch[act_col]]
+        target_texts = [_build_target(p) for p in batch[prompt_col]]
+        full_texts = [i + t for i, t in zip(input_texts, target_texts)]
+
+        # Tokenize full text (with truncation)
+        enc = tokenizer(
+            full_texts,
+            truncation=True,
+            max_length=max_length,
+            padding=False,
+        )
+
+        # Tokenize just the input part to find its length
+        enc_input = tokenizer(
+            input_texts,
+            truncation=True,
+            max_length=max_length,
+            padding=False,
+            add_special_tokens=False,
+        )
+
+        # Build labels: mask input tokens, keep target tokens
+        labels = []
+        for ids, input_ids in zip(enc["input_ids"], enc_input["input_ids"]):
+            n_input = min(len(input_ids), len(ids))
+            lab = [-100] * n_input + ids[n_input:]
+            labels.append(lab)
+
+        enc["labels"] = labels
+        return enc
+
+    return dataset.map(
+        _tokenize,
+        batched=True,
+        remove_columns=dataset.column_names,
+        desc="Tokenizing for generation",
+    )
+
+
 # ============================================================
 # 3. prompt tuning
 # ============================================================
-def generation_config(model_name, virtual_token):
+def create_peft_config(model_name, virtual_token):
     config = PromptTuningConfig(
         task_type=TaskType.CAUSAL_LM,
         prompt_tuning_init=PromptTuningInit.RANDOM,
@@ -247,62 +298,166 @@ def build_peft_model(model, peft_config):
     return peft_model
 
 
-def create_training_arguments(path, epochs, learning_rate=0.0035):
+def create_training_arguments(path, epochs, learning_rate=1e-3):
     training_args = TrainingArguments(
         output_dir=path,
-        auto_find_batch_size=True,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=4,
         learning_rate=learning_rate,
         num_train_epochs=epochs,
         remove_unused_columns=False,
+        eval_strategy="epoch",
+        save_strategy="epoch",
         save_total_limit=3,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        logging_steps=50,
+        warmup_steps=10,
+        lr_scheduler_type="cosine",
+        report_to="none",
+        fp16=True,
+        gradient_checkpointing=True,
     )
     return training_args
 
 
-def create_trainer(model, tokenizer, training_args, train_dataset):
+def create_trainer(model, tokenizer, training_args, train_dataset, eval_dataset):
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
+        eval_dataset=eval_dataset,
+        data_collator=DataCollatorForSeq2Seq(
+            tokenizer=tokenizer,
+            padding=True,
+            label_pad_token_id=-100,
+        ),
     )
     return trainer
 
 
-if __name__ == "__main__":
-    # model_name = "bigscience/bloomz-560m"
-    model_name = "bigscience/bloomz-1b1"
-    NUM_VIRTUAL_TOKEN = 50
-    NUM_EPOCHS = 10
-    OUTPUT_DIR_PROMPT = "./data/prompt_data"
+def generate_prompt(peft_model, tokenizer, act, max_new_tokens=200):
+    peft_model.eval()
+    prompt = f"act: {act}\nprompt:"
+    inputs = tokenizer(prompt, return_tensors="pt").to(peft_model.device)
 
-    # 1. base model
-    # ---------------------------------------------------------
+    with torch.no_grad():
+        out = peft_model.generate(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            repetition_penalty=1.2,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+
+    # Cut off the input part
+    generated = out[0][inputs["input_ids"].shape[1] :]
+    return tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+
+def load_trained_model(base_model, peft_path):
+    peft_model = PeftModel.from_pretrained(base_model, peft_path)
+    peft_model.eval()
+    return peft_model
+
+
+# ============================================================
+# 4. evaluation
+# ============================================================
+def compute_perplexity(trainer):
+    metrics = trainer.evaluate()
+    ppl = math.exp(metrics["eval_loss"])
+    print(f"Validation Perplexity: {ppl:.2f}")
+    return ppl
+
+
+def compare_with_baseline(base_model, peft_model, tokenizer, test_acts):
+    print("\n" + "=" * 70)
+    print("BASELINE vs PROMPT-TUNED")
+    print("=" * 70)
+    for act in test_acts:
+        print(f"\n--- ACT: {act} ---")
+        print(
+            "[BASE]     ",
+            generate_prompt(base_model, tokenizer, act, max_new_tokens=100)[:200],
+        )
+        print(
+            "[TUNED]    ",
+            generate_prompt(peft_model, tokenizer, act, max_new_tokens=100)[:200],
+        )
+
+
+if __name__ == "__main__":
+    model_name = "bigscience/bloomz-1b1"
+    NUM_VIRTUAL_TOKEN = 30
+    NUM_EPOCHS = 10
+    OUTPUT_DIR_PROMPT = "./data/prompt_data_taskA"
+    FINAL_SAVE_PATH = f"{OUTPUT_DIR_PROMPT}/final_peft"
+
+    # -------- If final model exists, skip everything --------
+    if os.path.exists(FINAL_SAVE_PATH):
+        print(f"Final model already exists at {FINAL_SAVE_PATH}. Loading it...")
+        base_model, base_tokenizer = load_base_model_and_tokenizer(model_name)
+        peft_model = load_trained_model(base_model, FINAL_SAVE_PATH)
+
+        for act in ["Ethereum Developer", "Travel Guide"]:
+            print(f"\n--- {act} ---")
+            print(generate_prompt(peft_model, base_tokenizer, act))
+        exit()
+
+    # -------- Load base --------
     base_model, base_tokenizer = load_base_model_and_tokenizer(model_name)
 
-    # prompt = "there are two nice things that should matter to you: "
-    # print(zero_shot(base_model, base_tokenizer, prompt))
-
-    # 2. dataset
-    # ---------------------------------------------------------
-    dataset_name = "fka/prompts.chat"
-
-    dataset = load_dataset(dataset_name)
+    # -------- Dataset --------
+    dataset = load_dataset("fka/prompts.chat")
     # dataset_first_look(dataset)
 
-    dataset_train, dataset_test = prepare_dataset_for_generation(dataset)
+    train_ds, val_ds = prepare_dataset_for_generation(
+        dataset["train"], max_prompt_chars=1500, test_size=0.1
+    )
+    tokenized_train = tokenize_for_generation(train_ds, base_tokenizer, "act", "prompt", 512)
+    tokenized_val = tokenize_for_generation(val_ds, base_tokenizer, "act", "prompt", 512)
 
-    # 3. prompt tuning
-    # ---------------------------------------------------------
-    # peft_config = generation_config(model_name, NUM_VIRTUAL_TOKEN)
-    # peft_model = build_peft_model(base_model, peft_config)
+    # -------- PEFT --------
+    peft_config = create_peft_config(model_name, NUM_VIRTUAL_TOKEN)
+    peft_model = build_peft_model(base_model, peft_config)
+    peft_model.enable_input_require_grads()
 
-    # trainin_arg = create_training_arguments(OUTPUT_DIR_PROMPT, NUM_EPOCHS)
+    # -------- Trainer --------
+    training_args = create_training_arguments(OUTPUT_DIR_PROMPT, NUM_EPOCHS)
+    trainer = create_trainer(
+        peft_model, base_tokenizer, training_args, tokenized_train, tokenized_val
+    )
 
-    # if base_tokenizer.pad_token is None:
-    #     base_tokenizer.pad_token = base_tokenizer.eos_token
+    # -------- Resume if a checkpoint exists --------
+    checkpoints = sorted(glob.glob(f"{OUTPUT_DIR_PROMPT}/checkpoint-*"))
+    if checkpoints:
+        print(f"Resuming from {checkpoints[-1]}")
+        trainer.train(resume_from_checkpoint=checkpoints[-1])
+    else:
+        print("Starting fresh training.")
+        trainer.train()
 
-    # tokenized_train = tokenize_dataset(dataset["train"], base_tokenizer, "act")
+    # -------- Save final --------
+    peft_model.save_pretrained(FINAL_SAVE_PATH)
+    base_tokenizer.save_pretrained(FINAL_SAVE_PATH)
+    print(f"Saved to {FINAL_SAVE_PATH}")
 
-    # trainer = create_trainer(peft_model, base_tokenizer, trainin_arg, tokenized_train)
-    # trainer.train()
+    # -------- Evaluate --------
+    compute_perplexity(trainer)
+
+    compare_with_baseline(
+        base_model,
+        peft_model,
+        base_tokenizer,
+        ["Ethereum Developer", "Linux Terminal", "Travel Guide"],
+    )
+
+    for act in ["Ethereum Developer", "Linux Terminal", "Travel Guide"]:
+        print(f"\n--- {act} ---")
+        print(generate_prompt(peft_model, base_tokenizer, act))
