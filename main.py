@@ -319,13 +319,13 @@ def create_training_arguments(path, epochs, learning_rate=1e-3):
         remove_unused_columns=False,
         eval_strategy="epoch",
         save_strategy="epoch",
-        save_total_limit=3,
+        save_total_limit=5,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        logging_steps=50,
+        logging_steps=100,
         warmup_steps=10,
-        lr_scheduler_type="cosine",
+        lr_scheduler_type="linear",
         report_to="none",
         fp16=True,
         gradient_checkpointing=True,
@@ -405,9 +405,9 @@ def compare_with_baseline(base_model, peft_model, tokenizer, test_acts):
 
 if __name__ == "__main__":
     model_name = "bigscience/bloomz-1b1"
-    NUM_VIRTUAL_TOKEN = 30
-    NUM_EPOCHS = 10
-    OUTPUT_DIR_PROMPT = "./data/prompt_data_taskA"
+    NUM_VIRTUAL_TOKEN = 100
+    NUM_EPOCHS = 8
+    OUTPUT_DIR_PROMPT = "./data/prompt_data"
     FINAL_SAVE_PATH = f"{OUTPUT_DIR_PROMPT}/final_peft"
 
     # -------- If final model exists, skip everything --------
@@ -440,7 +440,9 @@ if __name__ == "__main__":
     peft_model.enable_input_require_grads()
 
     # -------- Trainer --------
-    training_args = create_training_arguments(OUTPUT_DIR_PROMPT, NUM_EPOCHS)
+    training_args = create_training_arguments(
+        OUTPUT_DIR_PROMPT, NUM_EPOCHS, learning_rate=3e-4
+    )
     trainer = create_trainer(
         peft_model, base_tokenizer, training_args, tokenized_train, tokenized_val
     )
