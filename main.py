@@ -24,6 +24,7 @@ from collections import Counter
 import numpy as np
 import math
 import glob
+from functools import partial
 
 
 # ============================================================
@@ -228,8 +229,10 @@ def dataset_first_look(dataset, sample_size=2, text_columns=None):
     print("=" * 70)
 
 
-def preprocess_function(examples):
+from functools import partial
 
+
+def preprocess_function(examples, tokenizer, max_length=512):
     full_texts = [
         tokenizer.apply_chat_template(msg_list, tokenize=False, add_generation_prompt=False)
         for msg_list in examples["messages"]
@@ -242,8 +245,10 @@ def preprocess_function(examples):
         for msg_list in examples["messages"]
     ]
 
-    tokenized = tokenizer(full_texts, truncation=True, max_length=512, padding=False)
-    prompt_tokenized = tokenizer(prompt_texts, truncation=True, max_length=512, padding=False)
+    tokenized = tokenizer(full_texts, truncation=True, max_length=max_length, padding=False)
+    prompt_tokenized = tokenizer(
+        prompt_texts, truncation=True, max_length=max_length, padding=False
+    )
 
     labels = []
     for ids, prompt_ids in zip(tokenized["input_ids"], prompt_tokenized["input_ids"]):
@@ -283,13 +288,15 @@ def create_training_arguments(path, epochs, learning_rate=1e-3):
         learning_rate=learning_rate,
         num_train_epochs=epochs,
         remove_unused_columns=False,
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        save_total_limit=5,
+        eval_strategy="steps",
+        eval_steps=500,
+        save_strategy="steps",
+        save_steps=200,
+        save_total_limit=3,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        logging_steps=50,
+        logging_steps=100,
         warmup_steps=10,
         lr_scheduler_type="cosine",
         report_to="none",
@@ -378,75 +385,91 @@ def compute_perplexity(trainer):
 
 if __name__ == "__main__":
     model_name = "bigscience/bloomz-1b1"
-    NUM_VIRTUAL_TOKEN = 100
-    NUM_EPOCHS = 10
+    NUM_VIRTUAL_TOKEN = 50
+    NUM_EPOCHS = 5
     OUTPUT_DIR_PROMPT = "./data/prompt_data"
     FINAL_SAVE_PATH = f"{OUTPUT_DIR_PROMPT}/final_peft"
 
-    # -------- Load base --------
+    # ============ STEP 0: If final model exists, just do inference ============
+    if os.path.exists(FINAL_SAVE_PATH):
+        print(f"Final model exists at {FINAL_SAVE_PATH}. Loading for inference only...")
+        base_model, base_tokenizer = load_base_model_and_tokenizer(model_name)
+        peft_model = load_trained_model(base_model, FINAL_SAVE_PATH)
+
+        test_requests = [
+            "I need system instructions to define a friendly assistant personality...",
+            "Create a system prompt for a reliable agent...",
+        ]
+        for req in test_requests:
+            print("\n" + "=" * 50)
+            print(f"USER REQUEST: {req}")
+            print("-" * 50)
+            print("MODEL OUTPUT:")
+            print(generate_prompt(peft_model, base_tokenizer, req))
+        exit()
+
+    # ============ STEP 1: Load base ============
     base_model, base_tokenizer = load_base_model_and_tokenizer(model_name)
 
-    # -------- Dataset --------
+    # ============ STEP 2: Dataset ============
     dataset = load_dataset("kth8/system_prompts_Jobs-20000x")
-
     dataset = dataset.remove_columns(["uuid", "job", "length", "tokens"])
 
     split_dataset = dataset["train"].train_test_split(test_size=0.1, seed=42)
     train_ds = split_dataset["train"]
     val_ds = split_dataset["test"]
-
     print(f"Train size: {len(train_ds)}, Val size: {len(val_ds)}")
 
-    tokenized_train = train_ds.map(
-        preprocess_function,
-        batched=True,
-        remove_columns=["messages"],
-        desc="Tokenizing train data",
-    )
-    tokenized_val = val_ds.map(
-        preprocess_function,
-        batched=True,
-        remove_columns=["messages"],
-        desc="Tokenizing val data",
-    )
+    # ============ STEP 3: Chat template ============
+    if base_tokenizer.chat_template is None:
+        base_tokenizer.chat_template = (
+            "{% for message in messages %}"
+            "{{ message['role'] }}: {{ message['content'] }}\n"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}assistant:{% endif %}"
+        )
+        print("Chat template set manually.")
 
-    # -------- PEFT --------
+    # ============ STEP 4: Tokenize ============
+    tokenize_fn = partial(preprocess_function, tokenizer=base_tokenizer, max_length=256)
+    tokenized_train = train_ds.map(tokenize_fn, batched=True, remove_columns=["messages"])
+    tokenized_val = val_ds.map(tokenize_fn, batched=True, remove_columns=["messages"])
+
+    # ============ STEP 5: PEFT ============
     peft_config = create_peft_config(model_name, NUM_VIRTUAL_TOKEN)
     peft_model = build_peft_model(base_model, peft_config)
     peft_model.enable_input_require_grads()
 
-    # -------- Trainer --------
-    training_args = create_training_arguments(
-        OUTPUT_DIR_PROMPT,
-        NUM_EPOCHS,
-    )
-
+    # ============ STEP 6: Trainer ============
+    training_args = create_training_arguments(OUTPUT_DIR_PROMPT, NUM_EPOCHS)
     trainer = create_trainer(
         peft_model, base_tokenizer, training_args, tokenized_train, tokenized_val
     )
 
-    # -------- Resume if a checkpoint exists --------
-    checkpoints = sorted(glob.glob(f"{OUTPUT_DIR_PROMPT}/checkpoint-*"))
+    # ============ STEP 7: Resume if checkpoint exists ============
+    checkpoints = glob.glob(f"{OUTPUT_DIR_PROMPT}/checkpoint-*")
     if checkpoints:
+        checkpoints = sorted(
+            checkpoints, key=lambda x: int(re.search(r"checkpoint-(\d+)", x).group(1))
+        )
         print(f"Resuming from {checkpoints[-1]}")
         trainer.train(resume_from_checkpoint=checkpoints[-1])
     else:
         print("Starting fresh training.")
         trainer.train()
 
-    # -------- Save final --------
+    # ============ STEP 8: Save final ============
     peft_model.save_pretrained(FINAL_SAVE_PATH)
     base_tokenizer.save_pretrained(FINAL_SAVE_PATH)
     print(f"Saved to {FINAL_SAVE_PATH}")
 
-    # -------- Evaluate --------
+    # ============ STEP 9: Evaluate ============
     compute_perplexity(trainer)
 
     test_requests = [
         "I need system instructions to define a friendly assistant personality: an authority in Programmer, applications. The instructions must be brief",
         "Create a system prompt for a reliable agent that will help users with Writer problems. The prompt should be concise.",
     ]
-
     for req in test_requests:
         print("\n" + "=" * 50)
         print(f"USER REQUEST: {req}")
