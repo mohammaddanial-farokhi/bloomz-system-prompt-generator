@@ -1,5 +1,7 @@
 import os
 import torch
+import re
+import json
 
 _original_torch_load = torch.load
 
@@ -17,7 +19,10 @@ from transformers import (
     TrainingArguments,
     Trainer,
     DataCollatorForSeq2Seq,
+    TrainerState,
+    TrainerControl,
 )
+from transformers.trainer_utils import get_last_checkpoint
 from datasets import load_dataset, load_from_disk, Dataset, DatasetDict, Value
 from peft import get_peft_model, PromptTuningConfig, TaskType, PromptTuningInit, PeftModel
 from collections import Counter
@@ -229,9 +234,6 @@ def dataset_first_look(dataset, sample_size=2, text_columns=None):
     print("=" * 70)
 
 
-from functools import partial
-
-
 def preprocess_function(examples, tokenizer, max_length=512):
     full_texts = [
         tokenizer.apply_chat_template(msg_list, tokenize=False, add_generation_prompt=False)
@@ -289,9 +291,9 @@ def create_training_arguments(path, epochs, learning_rate=1e-3):
         num_train_epochs=epochs,
         remove_unused_columns=False,
         eval_strategy="steps",
-        eval_steps=500,
+        eval_steps=1000,
         save_strategy="steps",
-        save_steps=200,
+        save_steps=1000,
         save_total_limit=3,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
@@ -383,6 +385,111 @@ def compute_perplexity(trainer):
 #         )
 
 
+# ============================================================
+# 5. fix bugs
+# ============================================================
+def prepare_resume_checkpoint(trainer):
+    """
+    Find the latest checkpoint and recreate a missing trainer_state.json.
+    Existing trainer_state.json files are never overwritten.
+    """
+    output_dir = trainer.args.output_dir
+    checkpoint = get_last_checkpoint(output_dir)
+
+    if checkpoint is None:
+        print("No checkpoint found. Starting fresh.")
+        return None
+
+    state_path = os.path.join(checkpoint, "trainer_state.json")
+
+    print(f"Found checkpoint: {checkpoint}")
+    print(f"Configured save_steps: {trainer.args.save_steps}")
+    print(f"Configured eval_steps: {trainer.args.eval_steps}")
+
+    if os.path.isfile(state_path):
+        # Validate that the existing file is valid JSON.
+        with open(state_path, "r", encoding="utf-8") as f:
+            json.load(f)
+
+        print("Existing trainer_state.json found.")
+        return checkpoint
+
+    match = re.search(r"checkpoint-(\d+)$", checkpoint)
+    if match is None:
+        raise RuntimeError(f"Cannot determine checkpoint step: {checkpoint}")
+
+    step = int(match.group(1))
+
+    # Check that the checkpoint contains model weights.
+    has_weights = any(
+        os.path.isfile(os.path.join(checkpoint, filename))
+        for filename in (
+            "model.safetensors",
+            "pytorch_model.bin",
+            "adapter_model.safetensors",
+            "adapter_model.bin",
+        )
+    )
+
+    if not has_weights:
+        raise RuntimeError(
+            f"No recognized model weight file found in {checkpoint}. "
+            "Do not attempt to resume until the checkpoint is inspected."
+        )
+
+    # Recreate a minimal training state.
+    state = TrainerState(
+        global_step=step,
+        logging_steps=trainer.args.logging_steps,
+        eval_steps=trainer.args.eval_steps,
+        save_steps=trainer.args.save_steps,
+        num_train_epochs=int(trainer.args.num_train_epochs),
+        train_batch_size=trainer.args.train_batch_size,
+    )
+
+    control = TrainerControl()
+
+    if hasattr(control, "state"):
+        control_state = control.state()
+    else:
+        from dataclasses import asdict, is_dataclass
+
+        if not is_dataclass(control):
+            raise RuntimeError(
+                "Cannot determine the expected TrainerControl state "
+                "format for this Transformers version."
+            )
+
+        control_state = asdict(control)
+
+    callbacks = state.stateful_callbacks
+
+    if isinstance(callbacks, dict):
+        callbacks["TrainerControl"] = control_state
+    elif isinstance(callbacks, list):
+        callbacks.append(
+            {
+                "args": ["TrainerControl"],
+                "attributes": control_state,
+            }
+        )
+    else:
+        raise RuntimeError(
+            "Unsupported stateful_callbacks format. "
+            "Inspect the installed Transformers version before repairing."
+        )
+
+    state.save_to_json(state_path)
+
+    print(f"Recreated missing state: {state_path}")
+    print(
+        "Warning: previous log history and best-model metadata "
+        "cannot be recovered from the checkpoint number alone."
+    )
+
+    return checkpoint
+
+
 if __name__ == "__main__":
     model_name = "bigscience/bloomz-1b1"
     NUM_VIRTUAL_TOKEN = 50
@@ -457,6 +564,16 @@ if __name__ == "__main__":
     else:
         print("Starting fresh training.")
         trainer.train()
+
+    # If you encounter an error while loading checkpoints due to a missing trainer_state.json file, commit the code above, remove the code below from the commit, and run the training script again.
+    # last_checkpoint = prepare_resume_checkpoint(trainer)
+
+    # if last_checkpoint is not None:
+    #     print(f"Resuming from {last_checkpoint}")
+    #     trainer.train(resume_from_checkpoint=last_checkpoint)
+    # else:
+    #     print("Starting fresh training.")
+    #     trainer.train()
 
     # ============ STEP 8: Save final ============
     peft_model.save_pretrained(FINAL_SAVE_PATH)
