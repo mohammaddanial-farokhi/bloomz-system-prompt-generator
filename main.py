@@ -537,143 +537,136 @@ def ensure_chat_template(tokenizer):
 
 
 if __name__ == "__main__":
+    # ==================== CONFIG ====================
     model_name = "bigscience/bloomz-1b1"
     NUM_VIRTUAL_TOKEN = 50
     NUM_EPOCHS = 5
     OUTPUT_DIR_PROMPT = "./data/prompt_data"
     FINAL_SAVE_PATH = f"{OUTPUT_DIR_PROMPT}/final_peft"
 
-    # ============ STEP 0: If final model exists, just do inference ============
+    TEST_REQUESTS = [
+        "I need system instructions to define a friendly assistant personality: "
+        "an authority in Programmer, applications. The instructions must be brief",
+        "Create a system prompt for a reliable agent that will help users with "
+        "Writer problems. The prompt should be concise.",
+    ]
+
+    # ==================== STATE ====================
+    peft_model = None
+    base_tokenizer = None
+    trainer = None
+    skip_training = False
+    already_saved = False
+
+    # ==================== STEP 0: Load existing final model ====================
     if os.path.exists(FINAL_SAVE_PATH):
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Final model already exists at {FINAL_SAVE_PATH}")
         print(f"Loading for inference only. Delete the folder to retrain.")
-        print(f"{'='*60}\n")
+        print(f"{'=' * 60}\n")
+
         base_model, base_tokenizer = load_base_model_and_tokenizer(model_name)
         base_tokenizer = ensure_chat_template(base_tokenizer)
         peft_model = load_trained_model(base_model, FINAL_SAVE_PATH)
+        skip_training = True
 
-        test_requests = [
-            "I need system instructions to define a friendly assistant personality: an authority in Programmer, applications. The instructions must be brief",
-            "Create a system prompt for a reliable agent that will help users with Writer problems. The prompt should be concise.",
-        ]
-        for req in test_requests:
-            print("\n" + "=" * 50)
-            print(f"USER REQUEST: {req}")
-            print("-" * 50)
-            print("MODEL OUTPUT:")
-            print(generate_prompt(peft_model, base_tokenizer, req))
-        exit()
+    # ==================== STEPS 1-6: Training pipeline ====================
+    if not skip_training:
+        # -------- STEP 1: Load base model --------
+        base_model, base_tokenizer = load_base_model_and_tokenizer(model_name)
+        base_tokenizer = ensure_chat_template(base_tokenizer)
 
-    # ============ STEP 1: Load base ============
-    base_model, base_tokenizer = load_base_model_and_tokenizer(model_name)
+        # -------- STEP 2: Load dataset --------
+        dataset = load_dataset("kth8/system_prompts_Jobs-20000x")
+        dataset = dataset.remove_columns(["uuid", "job", "length", "tokens"])
 
-    # ============ STEP 2: Dataset ============
-    dataset = load_dataset("kth8/system_prompts_Jobs-20000x")
-    dataset = dataset.remove_columns(["uuid", "job", "length", "tokens"])
+        split_dataset = dataset["train"].train_test_split(test_size=0.1, seed=42)
+        train_ds = split_dataset["train"]
+        val_ds = split_dataset["test"]
+        print(f"Train size: {len(train_ds)}, Val size: {len(val_ds)}")
 
-    split_dataset = dataset["train"].train_test_split(test_size=0.1, seed=42)
-    train_ds = split_dataset["train"]
-    val_ds = split_dataset["test"]
-    print(f"Train size: {len(train_ds)}, Val size: {len(val_ds)}")
+        # -------- STEP 3: Tokenize --------
+        tokenize_fn = partial(preprocess_function, tokenizer=base_tokenizer, max_length=256)
+        tokenized_train = train_ds.map(tokenize_fn, batched=True, remove_columns=["messages"])
+        tokenized_val = val_ds.map(tokenize_fn, batched=True, remove_columns=["messages"])
 
-    # ============ STEP 3: Chat template ============
-    base_tokenizer = ensure_chat_template(base_tokenizer)
+        # -------- STEP 4: Build PEFT model --------
+        peft_config = create_peft_config(model_name, NUM_VIRTUAL_TOKEN)
+        peft_model = build_peft_model(base_model, peft_config)
+        peft_model.enable_input_require_grads()
 
-    # ============ STEP 4: Tokenize ============
-    tokenize_fn = partial(preprocess_function, tokenizer=base_tokenizer, max_length=256)
-    tokenized_train = train_ds.map(tokenize_fn, batched=True, remove_columns=["messages"])
-    tokenized_val = val_ds.map(tokenize_fn, batched=True, remove_columns=["messages"])
+        # -------- STEP 5: Build Trainer --------
+        training_args = create_training_arguments(OUTPUT_DIR_PROMPT, NUM_EPOCHS)
+        trainer = create_trainer(
+            peft_model, base_tokenizer, training_args, tokenized_train, tokenized_val
+        )
 
-    # ============ STEP 5: PEFT ============
-    peft_config = create_peft_config(model_name, NUM_VIRTUAL_TOKEN)
-    peft_model = build_peft_model(base_model, peft_config)
-    peft_model.enable_input_require_grads()
+        # -------- STEP 6: Resume / Finalize / Fresh --------
+        checkpoints = glob.glob(f"{OUTPUT_DIR_PROMPT}/checkpoint-*")
+        checkpoints = sorted(
+            checkpoints, key=lambda x: int(re.search(r"checkpoint-(\d+)", x).group(1))
+        )
 
-    # ============ STEP 6: Trainer ============
-    training_args = create_training_arguments(OUTPUT_DIR_PROMPT, NUM_EPOCHS)
-    trainer = create_trainer(
-        peft_model, base_tokenizer, training_args, tokenized_train, tokenized_val
-    )
+        if checkpoints:
+            mode = ask_resume_or_finalize(OUTPUT_DIR_PROMPT, checkpoints)
 
-    # ============ STEP 7: Resume or Finalize ============
-    checkpoints = glob.glob(f"{OUTPUT_DIR_PROMPT}/checkpoint-*")
-    checkpoints = sorted(
-        checkpoints, key=lambda x: int(re.search(r"checkpoint-(\d+)", x).group(1))
-    )
+            if mode == "quit":
+                print("Exiting without any action.")
+                exit()
 
-    if checkpoints:
-        mode = ask_resume_or_finalize(OUTPUT_DIR_PROMPT, checkpoints)
+            elif mode == "finalize":
+                last_ckpt = checkpoints[-1]
+                print(f"\nUsing checkpoint as final model: {last_ckpt}")
 
-        if mode == "quit":
-            print("Exiting without any action.")
-            exit()
+                # Free GPU memory
+                del peft_model, base_model, trainer
+                gc.collect()
+                torch.cuda.empty_cache()
 
-        elif mode == "finalize":
-            # Pick the last checkpoint
-            last_ckpt = checkpoints[-1]
-            print(f"\nUsing checkpoint as final model: {last_ckpt}")
+                # Load fresh base + attach checkpoint
+                print("Loading fresh base model for finalization...")
+                fresh_base_model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    device_map="auto",
+                    dtype=torch.float16,
+                )
+                peft_model, base_tokenizer = save_peft_from_checkpoint(
+                    checkpoint_path=last_ckpt,
+                    save_path=FINAL_SAVE_PATH,
+                    base_model=fresh_base_model,
+                    tokenizer=base_tokenizer,
+                )
+                print(f"✅ Saved to {FINAL_SAVE_PATH}")
+                trainer = None
+                already_saved = True
 
-            # Free the current peft_model from GPU
-            del peft_model
-            del base_model
-            del trainer
-            gc.collect()
-            torch.cuda.empty_cache()
+            elif mode == "resume":
+                print(f"\nResuming from {checkpoints[-1]}")
+                trainer.train(resume_from_checkpoint=checkpoints[-1])
 
-            # Load a fresh base model (clean, without any PEFT)
-            print("Loading fresh base model for finalization...")
-            fresh_base_model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                device_map="auto",
-                torch_dtype=torch.float16,
-            )
+        else:
+            print("No checkpoints found. Starting fresh training.")
+            trainer.train()
 
-            peft_model, base_tokenizer = save_peft_from_checkpoint(
-                checkpoint_path=last_ckpt,
-                save_path=FINAL_SAVE_PATH,
-                base_model=fresh_base_model,
-                tokenizer=base_tokenizer,
-            )
-            print(f"✅ Saved to {FINAL_SAVE_PATH}")
+    # ==================== STEP 7: Save final model ====================
+    if not skip_training and not already_saved:
+        peft_model.save_pretrained(FINAL_SAVE_PATH)
+        base_tokenizer.save_pretrained(FINAL_SAVE_PATH)
+        print(f"Saved to {FINAL_SAVE_PATH}")
 
-            # Test requests
-            test_requests = [
-                "I need system instructions to define a friendly assistant personality: an authority in Programmer, applications. The instructions must be brief",
-                "Create a system prompt for a reliable agent that will help users with Writer problems. The prompt should be concise.",
-            ]
-            for req in test_requests:
-                print("\n" + "=" * 50)
-                print(f"USER REQUEST: {req}")
-                print("-" * 50)
-                print("MODEL OUTPUT:")
-                print(generate_prompt(peft_model, base_tokenizer, req))
-            exit()
+    # ==================== STEP 8: Evaluate ====================
+    print(f"\n{'=' * 60}")
+    print("STEP 8: EVALUATION")
+    print(f"{'=' * 60}")
 
-        elif mode == "resume":
-            print(f"\nResuming from {checkpoints[-1]}")
-            trainer.train(resume_from_checkpoint=checkpoints[-1])
-
+    if trainer is not None:
+        compute_perplexity(trainer)
     else:
-        # No checkpoints found → start from scratch (only possible case)
-        print("No checkpoints found. Starting fresh training.")
-        trainer.train()
+        print("Skipping perplexity (no trainer available).")
 
-    # ============ STEP 8: Save final ============
-    peft_model.save_pretrained(FINAL_SAVE_PATH)
-    base_tokenizer.save_pretrained(FINAL_SAVE_PATH)
-    print(f"Saved to {FINAL_SAVE_PATH}")
-
-    # ============ STEP 9: Evaluate ============
-    compute_perplexity(trainer)
-
-    test_requests = [
-        "I need system instructions to define a friendly assistant personality: an authority in Programmer, applications. The instructions must be brief",
-        "Create a system prompt for a reliable agent that will help users with Writer problems. The prompt should be concise.",
-    ]
-    for req in test_requests:
-        print("\n" + "=" * 50)
+    for req in TEST_REQUESTS:
+        print(f"\n{'-' * 50}")
         print(f"USER REQUEST: {req}")
-        print("-" * 50)
+        print(f"{'-' * 50}")
         print("MODEL OUTPUT:")
         print(generate_prompt(peft_model, base_tokenizer, req))
