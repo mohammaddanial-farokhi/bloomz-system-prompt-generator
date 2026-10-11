@@ -30,6 +30,8 @@ import numpy as np
 import math
 import glob
 from functools import partial
+from save_peft_model import list_checkpoints, pick_best_checkpoint, save_peft_from_checkpoint
+import gc
 
 
 # ============================================================
@@ -323,7 +325,7 @@ def create_trainer(model, tokenizer, training_args, train_dataset, eval_dataset)
     return trainer
 
 
-def generate_prompt(peft_model, tokenizer, user_request, max_new_tokens=200):
+def generate_prompt(peft_model, tokenizer, user_request, max_new_tokens=600):
     peft_model.eval()
 
     messages = [
@@ -342,9 +344,10 @@ def generate_prompt(peft_model, tokenizer, user_request, max_new_tokens=200):
             attention_mask=inputs["attention_mask"],
             max_new_tokens=max_new_tokens,
             do_sample=True,
-            temperature=0.7,
-            top_p=0.9,
-            repetition_penalty=1.2,
+            temperature=0.4,
+            top_p=0.85,
+            repetition_penalty=1.4,
+            no_repeat_ngram_size=4,
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
         )
@@ -357,6 +360,36 @@ def load_trained_model(base_model, peft_path):
     peft_model = PeftModel.from_pretrained(base_model, peft_path)
     peft_model.eval()
     return peft_model
+
+
+def ask_resume_or_finalize(output_dir, checkpoints):
+    """
+    Ask the user what to do when checkpoints exist.
+    Returns one of: 'resume', 'finalize', 'quit'
+    """
+    print("\n" + "=" * 60)
+    print("CHECKPOINTS FOUND")
+    print("=" * 60)
+    for step, path in sorted(
+        [(int(re.search(r"checkpoint-(\d+)", c).group(1)), c) for c in checkpoints]
+    ):
+        print(f"  step {step:>6}  →  {path}")
+
+    print("\nWhat do you want to do?")
+    print("  [c] Continue training from the last checkpoint")
+    print("  [f] Finalize: use the last checkpoint as the final PEFT model")
+    print("  [q] Quit")
+
+    while True:
+        choice = input("\nYour choice [c/f/q]: ").strip().lower()
+        if choice in ("c", "continue"):
+            return "resume"
+        elif choice in ("f", "finalize"):
+            return "finalize"
+        elif choice in ("q", "quit"):
+            return "quit"
+        else:
+            print("Invalid choice. Please enter c, f, or q.")
 
 
 # ============================================================
@@ -490,6 +523,19 @@ def prepare_resume_checkpoint(trainer):
     return checkpoint
 
 
+def ensure_chat_template(tokenizer):
+    """Set a chat template if the tokenizer doesn't have one."""
+    if tokenizer.chat_template is None:
+        tokenizer.chat_template = (
+            "{% for message in messages %}"
+            "{{ message['role'] }}: {{ message['content'] }}\n"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}assistant:{% endif %}"
+        )
+        print("Chat template set manually.")
+    return tokenizer
+
+
 if __name__ == "__main__":
     model_name = "bigscience/bloomz-1b1"
     NUM_VIRTUAL_TOKEN = 50
@@ -499,13 +545,17 @@ if __name__ == "__main__":
 
     # ============ STEP 0: If final model exists, just do inference ============
     if os.path.exists(FINAL_SAVE_PATH):
-        print(f"Final model exists at {FINAL_SAVE_PATH}. Loading for inference only...")
+        print(f"\n{'='*60}")
+        print(f"Final model already exists at {FINAL_SAVE_PATH}")
+        print(f"Loading for inference only. Delete the folder to retrain.")
+        print(f"{'='*60}\n")
         base_model, base_tokenizer = load_base_model_and_tokenizer(model_name)
+        base_tokenizer = ensure_chat_template(base_tokenizer)
         peft_model = load_trained_model(base_model, FINAL_SAVE_PATH)
 
         test_requests = [
-            "I need system instructions to define a friendly assistant personality...",
-            "Create a system prompt for a reliable agent...",
+            "I need system instructions to define a friendly assistant personality: an authority in Programmer, applications. The instructions must be brief",
+            "Create a system prompt for a reliable agent that will help users with Writer problems. The prompt should be concise.",
         ]
         for req in test_requests:
             print("\n" + "=" * 50)
@@ -528,14 +578,7 @@ if __name__ == "__main__":
     print(f"Train size: {len(train_ds)}, Val size: {len(val_ds)}")
 
     # ============ STEP 3: Chat template ============
-    if base_tokenizer.chat_template is None:
-        base_tokenizer.chat_template = (
-            "{% for message in messages %}"
-            "{{ message['role'] }}: {{ message['content'] }}\n"
-            "{% endfor %}"
-            "{% if add_generation_prompt %}assistant:{% endif %}"
-        )
-        print("Chat template set manually.")
+    base_tokenizer = ensure_chat_template(base_tokenizer)
 
     # ============ STEP 4: Tokenize ============
     tokenize_fn = partial(preprocess_function, tokenizer=base_tokenizer, max_length=256)
@@ -553,27 +596,68 @@ if __name__ == "__main__":
         peft_model, base_tokenizer, training_args, tokenized_train, tokenized_val
     )
 
-    # ============ STEP 7: Resume if checkpoint exists ============
+    # ============ STEP 7: Resume or Finalize ============
     checkpoints = glob.glob(f"{OUTPUT_DIR_PROMPT}/checkpoint-*")
+    checkpoints = sorted(
+        checkpoints, key=lambda x: int(re.search(r"checkpoint-(\d+)", x).group(1))
+    )
+
     if checkpoints:
-        checkpoints = sorted(
-            checkpoints, key=lambda x: int(re.search(r"checkpoint-(\d+)", x).group(1))
-        )
-        print(f"Resuming from {checkpoints[-1]}")
-        trainer.train(resume_from_checkpoint=checkpoints[-1])
+        mode = ask_resume_or_finalize(OUTPUT_DIR_PROMPT, checkpoints)
+
+        if mode == "quit":
+            print("Exiting without any action.")
+            exit()
+
+        elif mode == "finalize":
+            # Pick the last checkpoint
+            last_ckpt = checkpoints[-1]
+            print(f"\nUsing checkpoint as final model: {last_ckpt}")
+
+            # Free the current peft_model from GPU
+            del peft_model
+            del base_model
+            del trainer
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # Load a fresh base model (clean, without any PEFT)
+            print("Loading fresh base model for finalization...")
+            fresh_base_model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="auto",
+                torch_dtype=torch.float16,
+            )
+
+            peft_model, base_tokenizer = save_peft_from_checkpoint(
+                checkpoint_path=last_ckpt,
+                save_path=FINAL_SAVE_PATH,
+                base_model=fresh_base_model,
+                tokenizer=base_tokenizer,
+            )
+            print(f"✅ Saved to {FINAL_SAVE_PATH}")
+
+            # Test requests
+            test_requests = [
+                "I need system instructions to define a friendly assistant personality: an authority in Programmer, applications. The instructions must be brief",
+                "Create a system prompt for a reliable agent that will help users with Writer problems. The prompt should be concise.",
+            ]
+            for req in test_requests:
+                print("\n" + "=" * 50)
+                print(f"USER REQUEST: {req}")
+                print("-" * 50)
+                print("MODEL OUTPUT:")
+                print(generate_prompt(peft_model, base_tokenizer, req))
+            exit()
+
+        elif mode == "resume":
+            print(f"\nResuming from {checkpoints[-1]}")
+            trainer.train(resume_from_checkpoint=checkpoints[-1])
+
     else:
-        print("Starting fresh training.")
+        # No checkpoints found → start from scratch (only possible case)
+        print("No checkpoints found. Starting fresh training.")
         trainer.train()
-
-    # If you encounter an error while loading checkpoints due to a missing trainer_state.json file, commit the code above, remove the code below from the commit, and run the training script again.
-    # last_checkpoint = prepare_resume_checkpoint(trainer)
-
-    # if last_checkpoint is not None:
-    #     print(f"Resuming from {last_checkpoint}")
-    #     trainer.train(resume_from_checkpoint=last_checkpoint)
-    # else:
-    #     print("Starting fresh training.")
-    #     trainer.train()
 
     # ============ STEP 8: Save final ============
     peft_model.save_pretrained(FINAL_SAVE_PATH)
