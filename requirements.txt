@@ -1,0 +1,10 @@
+aiohttp==3.14.3
+bitsandbytes==0.50.2
+evaluate==0.4.6
+loralib==0.1.2
+peft==0.21.0
+pip==26.2.1
+rouge_score==0.1.2
+sacrebleu==2.6.0
+torchaudio==2.5.1+cu121
+torchvision==0.20.1+cu121
